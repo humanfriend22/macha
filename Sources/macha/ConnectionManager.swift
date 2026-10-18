@@ -1,10 +1,10 @@
-import AppKit
 import Foundation
 import MQTTNIO
 import NIOCore
 import NIOPosix
 
-/// Owns the one long-lived MQTT connection and everything around it. Sensor sources only call `send`.
+/// Owns the one long-lived MQTT connection and everything around it. Sensor sources call `send`;
+/// the Network source also reports network changes and sleep/wake (`networkChanged`, `willSleep`, `didWake`).
 ///
 /// Built to run for weeks without attention:
 ///  - connects with a last-will, so Home Assistant marks the Mac unavailable if it vanishes
@@ -23,22 +23,22 @@ import NIOPosix
 /// <node> is the MQTT username, so one ACL rule per kind of topic (using `%u`) limits every
 /// user to its own topics.
 final class ConnectionManager {
-    private let config: Config
+    let config: Config
     private let node: String
     private let availabilityTopic: String
     private let client: MQTTClient
-    private let network = NetworkMonitor()
 
     /// All mutable state below is only touched on this queue.
     private let queue = DispatchQueue(label: "macha.connection")
     private var sensors: [String: Sensor] = [:]   // by id, filled by the first `send` of each
     private var latest: [String: String] = [:]     // topic -> newest payload wanted
     private var sent: [String: String] = [:]       // topic -> payload published in this broker session
-    private var isConnected = false
-    private var isConnecting = false
+    private enum State { case disconnected, connecting, connected, stopped }
+    private var state = State.disconnected
+    private var isConnected: Bool { state == .connected }
+    /// Reasons not to connect right now, besides `state`.
     private var networkAvailable = true
     private var sleeping = false
-    private var shuttingDown = false
     /// Bumped whenever the connection comes up or goes down, so late callbacks from an old
     /// connection can be recognised and ignored.
     private var generation = 0
@@ -47,14 +47,10 @@ final class ConnectionManager {
     private var healthTimer: DispatchSourceTimer?
     private var sweeping = false
     private var sweepMessages: [String: String] = [:]   // retained discovery messages seen while sweeping
-    private var loggedSweepProblem = false
-    private var lastFailureLog: Date?
-    private var hiddenFailures = 0
-    private var workspaceObservers: [NSObjectProtocol] = []
 
     /// `clientID` is only for `macha doctor`, so it never kicks a running agent off the broker.
-    init(config: Config, clientID: String? = nil) throws {
-        let endpoint = try config.endpoint()
+    init(config: Config, clientID: String? = nil) {
+        let endpoint = config.endpoint
         let node = config.username
         self.config = config
         self.node = node
@@ -93,33 +89,29 @@ final class ConnectionManager {
 
     // MARK: - Public API (thread-safe)
 
-    /// Starts connecting and watching the network and sleep/wake. Call once, on the main thread.
+    /// Starts connecting. Call once, on the main thread.
     func start() {
-        network.start { [weak self] available in
-            self?.queue.async { self?.networkChanged(available) }
-        }
-        observeSleepWake()
         queue.async {
             self.startHealthTimer()
             self.connect()
         }
     }
 
-    /// Reports a sensor's state (e.g. "ON", "OFF", "3") and optionally its attributes.
+    /// Reports a sensor's state (e.g. "ON", "OFF", "3", or nil if it has none) and optionally its attributes.
     /// Call it freely from any thread, as often as you like, connected or not:
     ///  - sensors that aren't in `enabled_sensors` are ignored
     ///  - unchanged values are skipped
     ///  - while offline nothing is queued; only the newest value is kept and sent on reconnect
     ///  - the first send of a sensor also announces it to Home Assistant (MQTT discovery)
-    func send(_ state: String, attributes: [String: Any]? = nil, for sensor: Sensor) {
-        guard config.enabledSensors.contains(sensor.id) else { return }
+    func send(_ state: String?, attributes: [String: Any]? = nil, for sensor: Sensor) {
+        guard config.isEnabled(sensor) else { return }
         let attributesJSON = attributes.flatMap(ConnectionManager.json)
         queue.async {
             if self.sensors[sensor.id] == nil {
                 self.sensors[sensor.id] = sensor
                 if self.isConnected { self.publishDiscovery(sensor) }
             }
-            self.deliver(self.stateTopic(sensor), state)
+            if let state { self.deliver(self.stateTopic(sensor), state) }
             if let attributesJSON { self.deliver(self.attributesTopic(sensor), attributesJSON) }
         }
     }
@@ -153,20 +145,17 @@ final class ConnectionManager {
     /// (not from an NIO event loop) right before exiting.
     func shutdown() {
         queue.sync {
-            shuttingDown = true
+            let wasConnected = isConnected
+            state = .stopped
             retryWork?.cancel()
             retryWork = nil
             healthTimer?.cancel()
             healthTimer = nil
-            if isConnected {
+            if wasConnected {
                 wait(for: publishRaw(availabilityTopic, "offline"), seconds: 2)
                 wait(for: client.disconnect(), seconds: 1)
-                isConnected = false
             }
         }
-        network.stop()
-        workspaceObservers.forEach { NSWorkspace.shared.notificationCenter.removeObserver($0) }
-        workspaceObservers.removeAll()
         // MQTTClient crashes if it is deallocated without being shut down.
         try? client.syncShutdownGracefully()
     }
@@ -174,8 +163,8 @@ final class ConnectionManager {
     // MARK: - Connecting
 
     private func connect() {
-        guard !shuttingDown, !sleeping, !isConnecting, !isConnected, networkAvailable else { return }
-        isConnecting = true
+        guard state == .disconnected, !sleeping, networkAvailable else { return }
+        state = .connecting
         retryWork?.cancel()
         retryWork = nil
 
@@ -192,19 +181,19 @@ final class ConnectionManager {
     }
 
     private func connectFinished(_ result: Result<Bool, Error>) {
-        isConnecting = false
+        let stopped = state == .stopped
+        if !stopped { state = .disconnected }
         switch result {
         case .success:
-            guard !shuttingDown else { return }
-            isConnected = true
+            guard !stopped else { return }
+            state = .connected
             generation += 1
             retryDelay = 1
-            lastFailureLog = nil
-            Log.info("connected to \(config.url)" + (hiddenFailures > 0 ? " (\(hiddenFailures) failed attempts not logged)" : ""))
-            hiddenFailures = 0
+            let missed = Log.reset(key: "connect-failure")
+            Log.info("connected to \(config.url)" + (missed > 0 ? " (\(missed) failed attempts not logged)" : ""))
             announce()
         case .failure(let error):
-            logConnectFailure(error)
+            Log.info("can't connect to \(config.url): \(error)", key: "connect-failure", every: 3600)
             scheduleReconnect()
         }
     }
@@ -212,7 +201,7 @@ final class ConnectionManager {
     /// The library told us the connection closed (not called for connections we dropped ourselves).
     private func connectionClosed() {
         guard isConnected else { return }   // failed connect, sleep, shutdown or dropConnection already handled it
-        isConnected = false
+        state = .disconnected
         generation += 1
         Log.info("connection closed, reconnecting")
         scheduleReconnect()
@@ -222,7 +211,7 @@ final class ConnectionManager {
     private func dropConnection(_ reason: String) {
         guard isConnected else { return }
         Log.info("connection lost (\(reason)), reconnecting")
-        isConnected = false
+        state = .disconnected
         generation += 1
         client.disconnect().whenComplete { _ in }   // best effort: closes the socket
         retryDelay = 1
@@ -231,7 +220,7 @@ final class ConnectionManager {
 
     /// Retry with exponential backoff (1s, 2s, 4s ... capped at 60s). Safe to call repeatedly.
     private func scheduleReconnect() {
-        guard !shuttingDown, !sleeping, retryWork == nil else { return }
+        guard state != .stopped, !sleeping, retryWork == nil else { return }
         let delay = retryDelay
         retryDelay = min(retryDelay * 2, 60)
         let work = DispatchWorkItem { [weak self] in
@@ -242,18 +231,12 @@ final class ConnectionManager {
         queue.asyncAfter(deadline: .now() + delay, execute: work)
     }
 
-    /// Logs the first failure of an outage, then at most one line per hour.
-    private func logConnectFailure(_ error: Error) {
-        if let last = lastFailureLog, Date().timeIntervalSince(last) < 3600 {
-            hiddenFailures += 1
-            return
-        }
-        Log.info("can't connect to \(config.url): \(error)" + (hiddenFailures > 0 ? " (\(hiddenFailures) more attempts since the last message)" : ""))
-        lastFailureLog = Date()
-        hiddenFailures = 0
+    /// The Network source reports whether the Mac has a route. Safe to call from any thread.
+    func networkChanged(available: Bool) {
+        queue.async { self.applyNetwork(available) }
     }
 
-    private func networkChanged(_ available: Bool) {
+    private func applyNetwork(_ available: Bool) {
         networkAvailable = available
         if available {
             // Network is back: don't wait for the backoff timer.
@@ -268,7 +251,7 @@ final class ConnectionManager {
             retryWork = nil
             // The socket is dead even if the library hasn't noticed yet.
             if isConnected {
-                isConnected = false
+                state = .disconnected
                 generation += 1
                 client.disconnect().whenComplete { _ in }
             }
@@ -299,25 +282,11 @@ final class ConnectionManager {
         }
     }
 
-    // MARK: - Sleep / wake
-
-    private func observeSleepWake() {
-        let center = NSWorkspace.shared.notificationCenter
-        workspaceObservers.append(
-            center.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: nil) { [weak self] _ in
-                self?.willSleep()
-            }
-        )
-        workspaceObservers.append(
-            center.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: nil) { [weak self] _ in
-                self?.didWake()
-            }
-        )
-    }
+    // MARK: - Sleep / wake (called by the Network source)
 
     /// Tell Home Assistant right away instead of waiting for the broker's keep-alive timeout.
     /// Runs on the main thread and blocks briefly, because the Mac is about to sleep.
-    private func willSleep() {
+    func willSleep() {
         queue.sync {
             sleeping = true
             retryWork?.cancel()
@@ -326,12 +295,12 @@ final class ConnectionManager {
             Log.info("going to sleep, disconnecting")
             wait(for: publishRaw(availabilityTopic, "offline"), seconds: 2)
             wait(for: client.disconnect(), seconds: 1)
-            isConnected = false
+            state = .disconnected
             generation += 1
         }
     }
 
-    private func didWake() {
+    func didWake() {
         // Give Wi-Fi and DNS a moment; the network monitor also triggers a connect when ready.
         queue.asyncAfter(deadline: .now() + 2) {
             self.sleeping = false
@@ -384,7 +353,6 @@ final class ConnectionManager {
         var payload: [String: Any] = [
             "name": sensor.name,
             "unique_id": "macha_\(node)_\(sensor.id)",
-            "state_topic": stateTopic(sensor),
             "availability_topic": availabilityTopic,
             "device": [
                 "identifiers": ["macha_\(node)"],
@@ -393,6 +361,7 @@ final class ConnectionManager {
                 "model": "Mac",
             ],
         ]
+        if sensor.hasState { payload["state_topic"] = stateTopic(sensor) }
         if sensor.hasAttributes { payload["json_attributes_topic"] = attributesTopic(sensor) }
         if let deviceClass = sensor.deviceClass { payload["device_class"] = deviceClass }
         if let unit = sensor.unit { payload["unit_of_measurement"] = unit }
@@ -430,10 +399,8 @@ final class ConnectionManager {
                     }
                 } else {
                     self.sweeping = false
-                    if !self.loggedSweepProblem {
-                        self.loggedSweepProblem = true
-                        Log.info("can't list retained sensors on \(filters.joined(separator: ", ")) (no read access?); removed sensors won't be cleaned up")
-                    }
+                    Log.info("can't list retained sensors on \(filters.joined(separator: ", ")) (no read access?); removed sensors won't be cleaned up",
+                             key: "sweep-denied", every: .infinity)
                 }
             }
         }
@@ -445,7 +412,7 @@ final class ConnectionManager {
         defer { sweepMessages.removeAll() }
         guard isConnected else { return }
 
-        let wanted = Set(SensorSources.sensors.map(\.id)).intersection(config.enabledSensors)
+        let wanted = Set(config.enabledSensors.map(\.id))
         let idPrefix = "macha_\(node)_"
         for (topic, text) in sweepMessages {
             guard let json = (try? JSONSerialization.jsonObject(with: Data(text.utf8))) as? [String: Any],

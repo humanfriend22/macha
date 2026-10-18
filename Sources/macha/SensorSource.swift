@@ -10,6 +10,10 @@ protocol SensorSource: AnyObject {
     /// Every sensor this source can report. Hardcoded: it's what `macha configure` offers.
     static var sensors: [Sensor] { get }
 
+    /// True for sources macha itself needs (like Network, which feeds the connection), so `macha run`
+    /// starts them even when none of their sensors are enabled.
+    static var alwaysRuns: Bool { get }
+
     init(manager: ConnectionManager)
 
     /// Begin watching, and report the initial state with `manager.send`.
@@ -23,8 +27,14 @@ protocol SensorSource: AnyObject {
 enum SensorSources {
     static let all: [any SensorSource.Type] = [
         BluetoothSensorSource.self,
+        NetworkSensorSource.self,
+        LocationSensorSource.self,
     ]
 
     /// Every sensor in this version of macha, in the order `macha configure` asks about them.
     static var sensors: [Sensor] { all.flatMap { $0.sensors } }
+}
+
+extension SensorSource {
+    static var alwaysRuns: Bool { false }
 }

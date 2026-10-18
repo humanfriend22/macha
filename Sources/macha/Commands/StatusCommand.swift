@@ -8,7 +8,7 @@ struct StatusCommand: ParsableCommand {
     )
 
     func run() throws {
-        let snapshot = BluetoothWatcher { _ in }.currentSnapshot()
+        let snapshot = BluetoothSensorSource.snapshot()
 
         print("Bluetooth")
         if snapshot.paired.isEmpty {

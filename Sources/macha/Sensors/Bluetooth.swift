@@ -1,64 +1,86 @@
 import Foundation
 import IOBluetooth
 
-/// Watches Bluetooth connect/disconnect events and reports which paired devices are connected.
+/// Reports Bluetooth state to Home Assistant, without interpreting it:
+///  - "Bluetooth connected devices": state = how many paired devices are connected,
+///    attributes = `connected` (names of the connected ones) and `paired` (names of all paired)
+/// What the devices are (headphones, a keyboard, ...) is for Home Assistant to work out.
+///
+/// Event-driven, with a slow safety-net timer.
 ///
 /// IMPORTANT: IOBluetooth delivers callbacks on the thread that registered them, and only
-/// while that thread's run loop is running. Create and start this on the main thread and
-/// keep the process alive with RunLoop.main.run() (or dispatchMain()).
-public final class BluetoothWatcher: NSObject {
-    public struct Snapshot: Equatable {
+/// while that thread's run loop is running. `start()` is called on the main thread and the
+/// process stays alive with RunLoop.main.run().
+final class BluetoothSensorSource: NSObject, SensorSource {
+    static let devices = Sensor(
+        id: "bluetooth_devices",
+        name: "Bluetooth connected devices",
+        component: .sensor,
+        icon: "mdi:bluetooth-connect",
+        stateClass: "measurement",
+        hasAttributes: true
+    )
+
+    static let sensors = [devices]
+
+    struct Snapshot: Equatable {
         /// Names of paired devices that are currently connected, sorted.
-        public var connected: [String]
+        var connected: [String]
         /// Names of all paired devices, sorted.
-        public var paired: [String]
+        var paired: [String]
     }
 
-    private let onChange: (Snapshot) -> Void
+    /// Current state, read straight from the system (used by `macha status` and `doctor`).
+    static func snapshot() -> Snapshot {
+        let devices = pairedDevices()
+        return Snapshot(
+            connected: devices.filter { $0.isConnected() }.map(name).sorted(),
+            paired: devices.map(name).sorted()
+        )
+    }
+
+    private let manager: ConnectionManager
     private var connectNotification: IOBluetoothUserNotification?
     /// Disconnect notifications are per-device, keyed by address.
     private var disconnectNotifications: [String: IOBluetoothUserNotification] = [:]
     private var last: Snapshot?
+    private var timer: Timer?
 
-    /// `onChange` runs on the main thread, only when the snapshot differs from the last one.
-    public init(onChange: @escaping (Snapshot) -> Void) {
-        self.onChange = onChange
+    init(manager: ConnectionManager) {
+        self.manager = manager
         super.init()
     }
 
     // MARK: - Lifecycle
 
-    public func start() {
+    func start() {
         // Fires whenever ANY Bluetooth device connects.
         connectNotification = IOBluetoothDevice.register(
             forConnectNotifications: self,
             selector: #selector(deviceConnected(_:fromDevice:))
         )
         // Disconnects can only be observed per device, so watch every paired device.
-        watchDisconnects(of: pairedDevices())
+        watchDisconnects(of: Self.pairedDevices())
         publishIfChanged()
+
+        // Safety net, and picks up newly paired devices (which have no event of their own).
+        timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+            self?.reconcile()
+        }
     }
 
-    public func stop() {
+    func stop() {
+        timer?.invalidate()
+        timer = nil
         connectNotification?.unregister()
         connectNotification = nil
         disconnectNotifications.values.forEach { $0.unregister() }
         disconnectNotifications.removeAll()
     }
 
-    /// Re-read state and publish if it changed. Call from a slow timer as a safety net.
-    public func reconcile() {
-        watchDisconnects(of: pairedDevices())   // picks up newly paired devices
+    private func reconcile() {
+        watchDisconnects(of: Self.pairedDevices())   // picks up newly paired devices
         publishIfChanged()
-    }
-
-    /// Current state without publishing (useful for a `status` command).
-    public func currentSnapshot() -> Snapshot {
-        let devices = pairedDevices()
-        return Snapshot(
-            connected: devices.filter { $0.isConnected() }.map(Self.name).sorted(),
-            paired: devices.map(Self.name).sorted()
-        )
     }
 
     // MARK: - Callbacks (selectors are called by IOBluetooth with these two arguments)
@@ -85,10 +107,6 @@ public final class BluetoothWatcher: NSObject {
 
     // MARK: - Helpers
 
-    private func pairedDevices() -> [IOBluetoothDevice] {
-        (IOBluetoothDevice.pairedDevices() as? [IOBluetoothDevice]) ?? []
-    }
-
     private func watchDisconnects(of devices: [IOBluetoothDevice]) {
         for device in devices {
             guard let address = device.addressString, disconnectNotifications[address] == nil else { continue }
@@ -99,11 +117,20 @@ public final class BluetoothWatcher: NSObject {
         }
     }
 
+    /// Sends the state to Home Assistant, only when it differs from the last one.
     private func publishIfChanged() {
-        let snapshot = currentSnapshot()
+        let snapshot = Self.snapshot()
         guard snapshot != last else { return }
         last = snapshot
-        onChange(snapshot)
+        manager.send(
+            String(snapshot.connected.count),
+            attributes: ["connected": snapshot.connected, "paired": snapshot.paired],
+            for: Self.devices
+        )
+    }
+
+    private static func pairedDevices() -> [IOBluetoothDevice] {
+        (IOBluetoothDevice.pairedDevices() as? [IOBluetoothDevice]) ?? []
     }
 
     private static func name(_ device: IOBluetoothDevice) -> String {

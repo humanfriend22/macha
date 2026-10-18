@@ -7,7 +7,7 @@ struct Macha: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "macha",
         abstract: "Send Mac state to Home Assistant over MQTT.",
-        version: "0.1.0",
+        version: "0.1.1",
         subcommands: [
             RunCommand.self,
             StatusCommand.self,

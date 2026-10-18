@@ -1,29 +1,38 @@
 import Foundation
 
-/// macha's configuration, stored as JSON (snake_case keys) at ~/.config/macha/config.json.
+/// macha's configuration, stored as JSON at ~/.config/macha/config.json.
 /// Everything here is chosen with `macha configure`; the sensors themselves are built into the binary.
+///
+/// The `enabled_sensors` list from the file is never exposed as is. Ask for the sensors by
+/// classification instead: `allowedSensors` (everything this version can send), and for a config
+/// `enabledSensors`, `disabledSensors` and `unknownSensorIDs` (ids in the file this version doesn't know).
 struct Config: Codable, Equatable {
     /// Full WebSocket URL of the MQTT broker, e.g. "wss://example.duckdns.org/mqtt".
     var url: String
-    /// Also the name of this Mac in Home Assistant, and what its topics are filed under.
     var username: String
     var password: String?
     var discoveryPrefix: String
-    /// IDs of the sensors to send to Home Assistant (see `SensorSources.sensors`).
-    var enabledSensors: [String]
+    /// `enabled_sensors` as written in the file, unknown ids included.
+    private var sensorIDs: [String]
 
     init(
         url: String,
         username: String,
         password: String? = nil,
         discoveryPrefix: String = "homeassistant",
-        enabledSensors: [String]
+        enabledSensors: [Sensor]
     ) {
         self.url = url
         self.username = username
         self.password = password
         self.discoveryPrefix = discoveryPrefix
-        self.enabledSensors = enabledSensors
+        self.sensorIDs = enabledSensors.map(\.id)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case url, username, password
+        case discoveryPrefix = "discovery_prefix"
+        case sensorIDs = "enabled_sensors"
     }
 
     // Missing keys fall back to empty/default values instead of failing to decode, so an old or
@@ -34,7 +43,39 @@ struct Config: Codable, Equatable {
         username = try c.decodeIfPresent(String.self, forKey: .username) ?? ""
         password = try c.decodeIfPresent(String.self, forKey: .password)
         discoveryPrefix = try c.decodeIfPresent(String.self, forKey: .discoveryPrefix) ?? "homeassistant"
-        enabledSensors = try c.decodeIfPresent([String].self, forKey: .enabledSensors) ?? []
+        sensorIDs = try c.decodeIfPresent([String].self, forKey: .sensorIDs) ?? []
+    }
+}
+
+// MARK: - Sensors
+
+extension Config {
+    /// Every sensor this version of macha can send: what `macha configure` offers.
+    static var allowedSensors: [Sensor] { SensorSources.sensors }
+
+    var enabledSensors: [Sensor] { Config.allowedSensors.filter(isEnabled) }
+    var disabledSensors: [Sensor] { Config.allowedSensors.filter { !isEnabled($0) } }
+    /// Ids in the file that this version doesn't have (removed or renamed sensors).
+    var unknownSensorIDs: [String] {
+        sensorIDs.filter { id in !Config.allowedSensors.contains { $0.id == id } }
+    }
+
+    func isEnabled(_ sensor: Sensor) -> Bool { sensorIDs.contains(sensor.id) }
+
+    /// The sources `macha run` starts: those with at least one enabled sensor, and the ones macha needs itself.
+    var enabledSources: [any SensorSource.Type] {
+        SensorSources.all.filter { source in source.alwaysRuns || source.sensors.contains(where: isEnabled) }
+    }
+}
+
+// MARK: - The broker
+
+extension Config {
+    /// `url` taken apart for the MQTT client. Only valid on a validated config: `Config.load()`
+    /// and `save()` check it, and `macha configure` (which may hold an unvalidated one) only reads `url`.
+    var endpoint: Endpoint {
+        do { return try Endpoint(url: url) }
+        catch { preconditionFailure("config was not validated: \(error.localizedDescription)") }
     }
 }
 
@@ -67,15 +108,8 @@ extension Config {
 // MARK: - Load / save
 
 extension Config {
-    private static var decoder: JSONDecoder {
-        let d = JSONDecoder()
-        d.keyDecodingStrategy = .convertFromSnakeCase
-        return d
-    }
-
     private static var encoder: JSONEncoder {
         let e = JSONEncoder()
-        e.keyEncodingStrategy = .convertToSnakeCase
         e.outputFormatting = [.prettyPrinted, .sortedKeys]
         return e
     }
@@ -95,7 +129,7 @@ extension Config {
         }
         let config: Config
         do {
-            config = try decoder.decode(Config.self, from: data)
+            config = try JSONDecoder().decode(Config.self, from: data)
         } catch {
             throw ConfigError.invalid("\(file): \(error.localizedDescription)")
         }
@@ -139,43 +173,6 @@ extension Config {
     }
 }
 
-// MARK: - The broker URL
-
-/// The broker URL taken apart for the MQTT client.
-struct Endpoint {
-    let host: String
-    /// nil means the scheme's standard port (80 for ws, 443 for wss).
-    let port: Int?
-    /// Path plus query exactly as given, "/" if the URL had none.
-    let path: String
-    let useTLS: Bool
-}
-
-extension Config {
-    /// macha only speaks MQTT over WebSocket: `ws://` or `wss://`. How the URL reaches the broker
-    /// (proxy, path, port) is up to whoever set the broker up.
-    static func parseEndpoint(_ url: String) throws -> Endpoint {
-        let trimmed = url.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let parts = URLComponents(string: trimmed),
-              let scheme = parts.scheme?.lowercased(), scheme == "ws" || scheme == "wss",
-              let host = parts.host, !host.isEmpty else {
-            throw ConfigError.invalid("`url` must be a WebSocket URL like wss://example.duckdns.org/mqtt (starting with ws:// or wss://)")
-        }
-        if parts.user != nil || parts.password != nil {
-            throw ConfigError.invalid("`url` must not contain a username or password; they have their own settings")
-        }
-        let path = parts.percentEncodedPath.isEmpty ? "/" : parts.percentEncodedPath
-        return Endpoint(
-            host: host,
-            port: parts.port,
-            path: parts.percentEncodedQuery.map { path + "?" + $0 } ?? path,
-            useTLS: scheme == "wss"
-        )
-    }
-
-    func endpoint() throws -> Endpoint { try Config.parseEndpoint(url) }
-}
-
 // MARK: - Validation
 
 extension Config {
@@ -183,7 +180,11 @@ extension Config {
         if url.trimmingCharacters(in: .whitespaces).isEmpty {
             throw ConfigError.invalid("`url` is missing")
         }
-        _ = try endpoint()
+        do {
+            _ = try Endpoint(url: url)
+        } catch let problem as Endpoint.Invalid {
+            throw ConfigError.invalid("`url` \(problem.reason)")
+        }
         if username.isEmpty {
             throw ConfigError.invalid("`username` is missing")
         }
@@ -191,7 +192,7 @@ extension Config {
             throw ConfigError.invalid("`username` may only contain letters, digits, `_` and `-`, because macha uses it in topic names")
         }
         if enabledSensors.isEmpty {
-            throw ConfigError.invalid("`enabled_sensors` is empty, so there is nothing to send")
+            throw ConfigError.invalid("no sensors are enabled, so there is nothing to send")
         }
     }
 

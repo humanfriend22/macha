@@ -4,7 +4,14 @@
 <dict>
   <key>CFBundleIdentifier</key><string>com.github.humanfriend22.macha</string>
   <key>CFBundleName</key><string>macha</string>
-  <key>CFBundleVersion</key><string>0.1.0</string>
+  <key>CFBundleExecutable</key><string>macha</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>LSUIElement</key><true/>
+  <key>CFBundleVersion</key><string>0.1.1</string>
+  <key>NSLocationUsageDescription</key>
+  <string>macha reports this Mac's location to Home Assistant.</string>
+  <key>NSLocationWhenInUseUsageDescription</key>
+  <string>macha reports this Mac's location to Home Assistant.</string>
   <key>NSBluetoothAlwaysUsageDescription</key>
   <string>macha reports which Bluetooth devices are connected to Home Assistant.</string>
 </dict>

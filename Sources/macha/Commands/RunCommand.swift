@@ -10,17 +10,14 @@ struct RunCommand: ParsableCommand {
 
     func run() throws {
         let config = try Config.load()
-        let manager = try ConnectionManager(config: config)
+        let manager = ConnectionManager(config: config)
 
         // Start every source that provides at least one enabled sensor. The manager drops
         // sends for sensors that aren't enabled. Add new sources to `SensorSources.all`.
-        let enabled = Set(config.enabledSensors)
-        for id in enabled.subtracting(SensorSources.sensors.map(\.id)).sorted() {
+        for id in config.unknownSensorIDs {
             Log.info("ignoring unknown sensor `\(id)` (run `macha configure` to see the available ones)")
         }
-        let sources: [any SensorSource] = SensorSources.all
-            .filter { type in type.sensors.contains { enabled.contains($0.id) } }
-            .map { $0.init(manager: manager) }
+        let sources: [any SensorSource] = config.enabledSources.map { $0.init(manager: manager) }
 
         // On SIGTERM (brew services stop) or Ctrl-C: stop sources, tell HA we're offline, exit.
         signal(SIGTERM, SIG_IGN)
