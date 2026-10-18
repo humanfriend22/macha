@@ -9,7 +9,7 @@ set -euo pipefail
 
 step="${1:-}"
 channel="${CHANNEL:-release}"
-app=.build/macha.app
+app="${2:-.build}/macha.app"
 
 if [ "$step" != compile ] && [ "$step" != package ] && [ "$step" != all ]; then
   echo "usage: scripts/build.sh [compile|package|all] [output directory]"
