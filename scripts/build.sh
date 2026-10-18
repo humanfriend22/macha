@@ -1,32 +1,38 @@
 #!/bin/bash
 # Builds macha and wraps it in a minimal macha.app.
-#
-# macOS only shows the Location Services prompt (and remembers the answer) for a process that
-# lives in an app bundle with an Info.plist and a code signature; a bare command-line binary
-# never gets one. The binary is still run as a command: macha.app/Contents/MacOS/macha.
-#
-# usage: scripts/build.sh [output directory (default: .build)]
-#        CONFIG=debug scripts/build.sh      # debug build instead of release
+
+# usage (from the repo root): scripts/build.sh [compile|package|all] [output directory (default: .build)]
+#        With no arguments, does both (all). The Homebrew formula runs them as two
+#        steps so it can print a status message between them.
+#        CHANNEL=debug scripts/build.sh      # debug build instead of release
 set -euo pipefail
 
-here="$(cd "$(dirname "$0")/.." && pwd)"
-config="${CONFIG:-release}"
-app="${1:-$here/.build}/macha.app"
+step="${1:-}"
+channel="${CHANNEL:-release}"
+app=.build/macha.app
 
-cd "$here"
-# --disable-sandbox: SwiftPM's own sandbox can't nest inside Homebrew's.
-swift build --disable-sandbox -c "$config"
-binary="$(swift build --disable-sandbox -c "$config" --show-bin-path)/macha"
+if [ "$step" != compile ] && [ "$step" != package ] && [ "$step" != all ]; then
+  echo "usage: scripts/build.sh [compile|package|all] [output directory]"
+  exit 1
+fi
 
-rm -rf "$app"
-mkdir -p "$app/Contents/MacOS"
-cp "$binary" "$app/Contents/MacOS/macha"
-cp Resources/Info.plist "$app/Contents/Info.plist"
+# Compile the Swift binary
+if [ "$step" = compile ] || [ "$step" = all ]; then
+  swift build --disable-sandbox -c "$channel"
+fi
 
-# Ad-hoc signature (no developer account needed). By default an ad-hoc signature is identified by
-# the hash of the exact binary, so every rebuild would look like a new app to macOS and lose its
-# privacy permissions (Location, Bluetooth). The explicit requirement below identifies it by name instead.
-id=com.github.humanfriend22.macha
-codesign --force --sign - --identifier "$id" -r="designated => identifier \"$id\"" "$app"
-echo "Built $app"
-echo "Run it with: $app/Contents/MacOS/macha"
+# Package the binary into an ad-hoc signed app
+if [ "$step" = package ] || [ "$step" = all ]; then
+  binary="$(swift build --disable-sandbox -c "$channel" --show-bin-path)/macha"
+  rm -rf "$app"
+  mkdir -p "$app/Contents/MacOS"
+  cp "$binary" "$app/Contents/MacOS/macha"
+  cp Resources/Info.plist "$app/Contents/Info.plist"
+
+  # By default an ad-hoc signature is identified by the hash of the exact binary,
+  # so every rebuild would look like a new app to macOS.
+  # The explicit requirement below identifies it by name instead.
+  id=com.github.humanfriend22.macha
+  codesign --force --sign - --identifier "$id" -r="designated => identifier \"$id\"" "$app"
+  echo "Packaged $app"
+fi
